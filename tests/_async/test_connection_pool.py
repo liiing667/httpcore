@@ -835,3 +835,218 @@ async def test_http11_upgrade_connection():
         "http11.response_closed.started",
         "http11.response_closed.complete",
     ]
+
+
+@pytest.mark.anyio
+async def test_connection_pool_recycles_connections_past_max_connection_age():
+    """
+    Idle connections that exceed `max_connection_age` should be recycled
+    rather than reused.
+    """
+    network_backend = httpcore.AsyncMockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+
+    async with httpcore.AsyncConnectionPool(
+        max_connection_age=0.0, network_backend=network_backend
+    ) as pool:
+        # Sending an intial request, which once complete will not return
+        # to the pool, since it immediately exceeds the maximum age.
+        async with pool.stream("GET", "https://example.com/") as response:
+            info = [repr(c) for c in pool.connections]
+            assert info == [
+                "<AsyncHTTPConnection ['https://example.com:443', HTTP/1.1, ACTIVE, Request Count: 1]>"
+            ]
+            await response.aread()
+
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+        assert pool.connections == []
+        assert pool.get_stats() == {"recycled": 1, "retried": 0, "idle_expired": 0}
+
+        # A second request requires a freshly established connection.
+        async with pool.stream("GET", "https://example.com/") as response:
+            info = [repr(c) for c in pool.connections]
+            assert info == [
+                "<AsyncHTTPConnection ['https://example.com:443', HTTP/1.1, ACTIVE, Request Count: 1]>"
+            ]
+            await response.aread()
+
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+        assert pool.connections == []
+        assert pool.get_stats() == {"recycled": 2, "retried": 0, "idle_expired": 0}
+
+
+@pytest.mark.anyio
+async def test_connection_pool_retries_idempotent_request_on_stale_connection():
+    """
+    Idempotent requests that fail on a reused connection that has been
+    silently closed by the server are retried once on a new connection.
+    """
+    network_backend = httpcore.AsyncMockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+
+    async with httpcore.AsyncConnectionPool(network_backend=network_backend) as pool:
+        # An initial request, leaving an IDLE connection in the pool.
+        async with pool.stream("GET", "https://example.com/") as response:
+            await response.aread()
+
+        assert response.status == 200
+        assert pool.get_stats() == {"recycled": 0, "retried": 0, "idle_expired": 0}
+
+        # The IDLE connection has now been silently closed by the server.
+        # (The mock stream returns b"" once its buffer is exhausted.)
+        # The request fails on the stale connection, and is transparently
+        # retried on a freshly established connection.
+        async with pool.stream("GET", "https://example.com/") as response:
+            await response.aread()
+
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+        assert pool.get_stats() == {"recycled": 1, "retried": 1, "idle_expired": 0}
+
+
+@pytest.mark.anyio
+async def test_connection_pool_does_not_retry_non_idempotent_request():
+    """
+    Non-idempotent requests that fail on a stale reused connection
+    must raise the error to the caller, rather than being retried.
+    """
+    network_backend = httpcore.AsyncMockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+
+    async with httpcore.AsyncConnectionPool(network_backend=network_backend) as pool:
+        # An initial request, leaving an IDLE connection in the pool.
+        async with pool.stream("GET", "https://example.com/") as response:
+            await response.aread()
+
+        assert response.status == 200
+
+        # The IDLE connection has now been silently closed by the server.
+        # A non-idempotent request fails, and the error is raised as-is.
+        with pytest.raises(httpcore.RemoteProtocolError):
+            await pool.request("POST", "https://example.com/", content=b"Hello")
+
+        assert pool.get_stats() == {"recycled": 0, "retried": 0, "idle_expired": 0}
+
+
+@pytest.mark.anyio
+async def test_connection_pool_with_retry_stale_connections_disabled():
+    """
+    With `retry_stale_connections=False` no retry occurs when a reused
+    connection has been silently closed by the server.
+    """
+    network_backend = httpcore.AsyncMockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+
+    async with httpcore.AsyncConnectionPool(
+        retry_stale_connections=False, network_backend=network_backend
+    ) as pool:
+        # An initial request, leaving an IDLE connection in the pool.
+        async with pool.stream("GET", "https://example.com/") as response:
+            await response.aread()
+
+        assert response.status == 200
+
+        # The IDLE connection has now been silently closed by the server.
+        with pytest.raises(httpcore.RemoteProtocolError):
+            await pool.request("GET", "https://example.com/")
+
+        assert pool.get_stats() == {"recycled": 0, "retried": 0, "idle_expired": 0}
+
+
+@pytest.mark.anyio
+async def test_connection_pool_stats_with_keepalive_expiry():
+    """
+    Idle connections expiring via `keepalive_expiry` are included
+    in the `idle_expired` stat.
+    """
+    network_backend = httpcore.AsyncMockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+
+    async with httpcore.AsyncConnectionPool(
+        keepalive_expiry=0.0, network_backend=network_backend
+    ) as pool:
+        async with pool.stream("GET", "https://example.com/") as response:
+            await response.aread()
+
+        assert response.status == 200
+        assert pool.connections == []
+        assert pool.get_stats() == {"recycled": 0, "retried": 0, "idle_expired": 1}
+
+
+@pytest.mark.trio
+async def test_connection_pool_concurrent_stale_connection_retries():
+    """
+    Concurrent requests that each check out a stale connection must all be
+    retried on fresh connections, without any double-counting of the stats.
+    """
+    network_backend = httpcore.AsyncMockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+
+    async def fetch(pool, results):
+        response = await pool.request("GET", "https://example.com/")
+        results.append(response.status)
+
+    async with httpcore.AsyncConnectionPool(
+        max_connections=2, network_backend=network_backend
+    ) as pool:
+        # Two concurrent requests, leaving two IDLE connections in the pool.
+        results: typing.List[int] = []
+        async with concurrency.open_nursery() as nursery:
+            for _ in range(2):
+                nursery.start_soon(fetch, pool, results)
+        assert results == [200, 200]
+        assert len(pool.connections) == 2
+
+        # Both IDLE connections have now been silently closed by the server.
+        # Both requests are retried on freshly established connections.
+        results = []
+        async with concurrency.open_nursery() as nursery:
+            for _ in range(2):
+                nursery.start_soon(fetch, pool, results)
+        assert results == [200, 200]
+
+        assert pool.get_stats() == {"recycled": 2, "retried": 2, "idle_expired": 0}

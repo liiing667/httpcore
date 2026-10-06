@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## Unreleased
 
+- Add `max_connection_age` and `retry_stale_connections` arguments to the connection
+  pool, recycling over-age connections and retrying idempotent requests that fail on
+  a stale reused connection. Pool health counters are available via `pool.get_stats()`.
 - Fix `max_keepalive_connections` not being properly handled. (#1000)
 
 ## Version 1.0.9 (April 24th, 2025)

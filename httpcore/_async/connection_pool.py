@@ -2,30 +2,55 @@ from __future__ import annotations
 
 import ssl
 import sys
+import time
 import types
 import typing
 
 from .._backends.auto import AutoBackend
 from .._backends.base import SOCKET_OPTION, AsyncNetworkBackend
-from .._exceptions import ConnectionNotAvailable, UnsupportedProtocol
+from .._exceptions import (
+    ConnectionNotAvailable,
+    NetworkError,
+    RemoteProtocolError,
+    UnsupportedProtocol,
+)
 from .._models import Origin, Proxy, Request, Response
 from .._synchronization import AsyncEvent, AsyncShieldCancellation, AsyncThreadLock
 from .connection import AsyncHTTPConnection
 from .interfaces import AsyncConnectionInterface, AsyncRequestInterface
+
+# HTTP methods that are safe to retry on a fresh connection if a
+# reused connection turns out to have been silently closed.
+IDEMPOTENT_METHODS = frozenset(
+    {b"GET", b"HEAD", b"PUT", b"DELETE", b"OPTIONS", b"TRACE"}
+)
 
 
 class AsyncPoolRequest:
     def __init__(self, request: Request) -> None:
         self.request = request
         self.connection: AsyncConnectionInterface | None = None
+        # Set when the assigned connection was reused from the pool,
+        # rather than being newly established.
+        self.reused_connection = False
+        # Set once a request has been retried after failing on a stale
+        # reused connection, so that it is not retried more than once.
+        self.stale_retry_used = False
+        # Set when a request must be assigned a freshly established
+        # connection, rather than reusing an existing one.
+        self.force_new_connection = False
         self._connection_acquired = AsyncEvent()
 
-    def assign_to_connection(self, connection: AsyncConnectionInterface | None) -> None:
+    def assign_to_connection(
+        self, connection: AsyncConnectionInterface | None, reused: bool = False
+    ) -> None:
         self.connection = connection
+        self.reused_connection = reused
         self._connection_acquired.set()
 
     def clear_connection(self) -> None:
         self.connection = None
+        self.reused_connection = False
         self._connection_acquired = AsyncEvent()
 
     async def wait_for_connection(
@@ -52,6 +77,8 @@ class AsyncConnectionPool(AsyncRequestInterface):
         max_connections: int | None = 10,
         max_keepalive_connections: int | None = None,
         keepalive_expiry: float | None = None,
+        max_connection_age: float | None = None,
+        retry_stale_connections: bool = True,
         http1: bool = True,
         http2: bool = False,
         retries: int = 0,
@@ -74,6 +101,16 @@ class AsyncConnectionPool(AsyncRequestInterface):
                 that will be maintained in the pool.
             keepalive_expiry: The duration in seconds that an idle HTTP connection
                 may be maintained for before being expired from the pool.
+            max_connection_age: The maximum duration in seconds that an HTTP
+                connection may be reused for, counted from when it is added to
+                the pool. An idle connection that exceeds this age is recycled
+                instead of being reused. If `None`, connections do not expire
+                by age. Unlike `keepalive_expiry` this timer is not reset while
+                a connection is in the pool.
+            retry_stale_connections: A boolean indicating if requests that fail
+                on a connection reused from the pool should be retried once on a
+                new connection. Only idempotent requests (GET, HEAD, PUT,
+                DELETE, OPTIONS, TRACE) are retried. Defaults to `True`.
             http1: A boolean indicating if HTTP/1.1 requests should be supported
                 by the connection pool. Defaults to True.
             http2: A boolean indicating if HTTP/2 requests should be supported by
@@ -104,6 +141,8 @@ class AsyncConnectionPool(AsyncRequestInterface):
         )
 
         self._keepalive_expiry = keepalive_expiry
+        self._max_connection_age = max_connection_age
+        self._retry_stale_connections = retry_stale_connections
         self._http1 = http1
         self._http2 = http2
         self._retries = retries
@@ -119,6 +158,11 @@ class AsyncConnectionPool(AsyncRequestInterface):
         # and the set of connections that are servicing those requests.
         self._connections: list[AsyncConnectionInterface] = []
         self._requests: list[AsyncPoolRequest] = []
+        # The time at which each connection was added to the pool.
+        self._connection_birth: dict[AsyncConnectionInterface, float] = {}
+
+        # Counters exposed by `get_stats()`.
+        self._stats = {"recycled": 0, "retried": 0, "idle_expired": 0}
 
         # We only mutate the state of the connection pool within an 'optional_thread_lock'
         # context. This holds a threading lock unless we're running in async mode,
@@ -242,6 +286,24 @@ class AsyncConnectionPool(AsyncRequestInterface):
                     #
                     # In this case we clear the connection and try again.
                     pool_request.clear_connection()
+                except (NetworkError, RemoteProtocolError) as exc:
+                    # A connection that was reused from the pool may have been
+                    # silently closed by the remote host. Idempotent requests
+                    # are retried once on a freshly established connection.
+                    if not self._should_retry_stale_connection(pool_request):
+                        raise exc from None
+                    with self._optional_thread_lock:
+                        if connection in self._connections:
+                            self._remove_connection(connection)
+                            self._stats["recycled"] += 1
+                            closing = [connection]
+                        else:
+                            closing = []
+                        self._stats["retried"] += 1
+                        pool_request.clear_connection()
+                        pool_request.stale_retry_used = True
+                        pool_request.force_new_connection = True
+                    await self._close_connections(closing)
                 else:
                     break  # pragma: nocover
 
@@ -267,6 +329,18 @@ class AsyncConnectionPool(AsyncRequestInterface):
             extensions=response.extensions,
         )
 
+    def _should_retry_stale_connection(self, pool_request: AsyncPoolRequest) -> bool:
+        return (
+            self._retry_stale_connections
+            and pool_request.reused_connection
+            and not pool_request.stale_retry_used
+            and pool_request.request.method in IDEMPOTENT_METHODS
+        )
+
+    def _remove_connection(self, connection: AsyncConnectionInterface) -> None:
+        self._connections.remove(connection)
+        self._connection_birth.pop(connection, None)
+
     def _assign_requests_to_connections(self) -> list[AsyncConnectionInterface]:
         """
         Manage the state of the connection pool, assigning incoming
@@ -278,35 +352,52 @@ class AsyncConnectionPool(AsyncRequestInterface):
         those connections to be handled seperately.
         """
         closing_connections = []
+        now = time.monotonic()
 
         # First we handle cleaning up any connections that are closed,
-        # have expired their keep-alive, or surplus idle connections.
+        # have exceeded their maximum age, have expired their keep-alive,
+        # or surplus idle connections.
         for connection in list(self._connections):
             if connection.is_closed():
                 # log: "removing closed connection"
-                self._connections.remove(connection)
+                self._remove_connection(connection)
+            elif (
+                connection.is_idle()
+                and self._max_connection_age is not None
+                and now - self._connection_birth.get(connection, now)
+                > self._max_connection_age
+            ):
+                # log: "recycling connection past its maximum age"
+                self._remove_connection(connection)
+                closing_connections.append(connection)
+                self._stats["recycled"] += 1
             elif connection.has_expired():
                 # log: "closing expired connection"
-                self._connections.remove(connection)
+                self._remove_connection(connection)
                 closing_connections.append(connection)
+                self._stats["idle_expired"] += 1
             elif (
                 connection.is_idle()
                 and sum(connection.is_idle() for connection in self._connections)
                 > self._max_keepalive_connections
             ):
                 # log: "closing idle connection"
-                self._connections.remove(connection)
+                self._remove_connection(connection)
                 closing_connections.append(connection)
 
         # Assign queued requests to connections.
         queued_requests = [request for request in self._requests if request.is_queued()]
         for pool_request in queued_requests:
             origin = pool_request.request.url.origin
-            available_connections = [
-                connection
-                for connection in self._connections
-                if connection.can_handle_request(origin) and connection.is_available()
-            ]
+            if pool_request.force_new_connection:
+                available_connections = []
+            else:
+                available_connections = [
+                    connection
+                    for connection in self._connections
+                    if connection.can_handle_request(origin)
+                    and connection.is_available()
+                ]
             idle_connections = [
                 connection for connection in self._connections if connection.is_idle()
             ]
@@ -320,20 +411,24 @@ class AsyncConnectionPool(AsyncRequestInterface):
             if available_connections:
                 # log: "reusing existing connection"
                 connection = available_connections[0]
-                pool_request.assign_to_connection(connection)
+                pool_request.assign_to_connection(
+                    connection, reused=connection.is_idle()
+                )
             elif len(self._connections) < self._max_connections:
                 # log: "creating new connection"
                 connection = self.create_connection(origin)
                 self._connections.append(connection)
+                self._connection_birth[connection] = now
                 pool_request.assign_to_connection(connection)
             elif idle_connections:
                 # log: "closing idle connection"
                 connection = idle_connections[0]
-                self._connections.remove(connection)
+                self._remove_connection(connection)
                 closing_connections.append(connection)
                 # log: "creating new connection"
                 connection = self.create_connection(origin)
                 self._connections.append(connection)
+                self._connection_birth[connection] = now
                 pool_request.assign_to_connection(connection)
 
         return closing_connections
@@ -350,7 +445,22 @@ class AsyncConnectionPool(AsyncRequestInterface):
         with self._optional_thread_lock:
             closing_connections = list(self._connections)
             self._connections = []
+            self._connection_birth = {}
         await self._close_connections(closing_connections)
+
+    def get_stats(self) -> dict[str, int]:
+        """
+        Return a snapshot of the connection pool health counters.
+
+        * `recycled`: Connections discarded by the pool health policy, either
+          for exceeding `max_connection_age`, or for failing on reuse.
+        * `retried`: Requests retried on a new connection after a reused
+          connection failed.
+        * `idle_expired`: Idle connections expired by `keepalive_expiry`, or
+          closed by the remote host while idle.
+        """
+        with self._optional_thread_lock:
+            return dict(self._stats)
 
     async def __aenter__(self) -> AsyncConnectionPool:
         return self

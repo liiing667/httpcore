@@ -64,6 +64,15 @@ The connection pool instance is also the main point of configuration. Let's take
                                be maintained in the pool.
 * `keepalive_expiry`: The duration in seconds that an idle HTTP connection may be
                       maintained for before being expired from the pool.
+* `max_connection_age`: The maximum duration in seconds that an HTTP connection may be
+                        reused for, counted from when it is added to the pool. An idle
+                        connection that exceeds this age is recycled instead of being
+                        reused. Unlike `keepalive_expiry` this timer is not reset while
+                        a connection is in the pool. Defaults to `None`.
+* `retry_stale_connections`: A boolean indicating if requests that fail on a connection
+                             reused from the pool should be retried once on a new
+                             connection. Only idempotent requests (`GET`, `HEAD`, `PUT`,
+                             `DELETE`, `OPTIONS`, `TRACE`) are retried. Defaults to `True`.
 
 ### HTTP version support
 
