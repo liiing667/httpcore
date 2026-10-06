@@ -2,22 +2,37 @@ from __future__ import annotations
 
 import ssl
 import sys
+import time
 import types
 import typing
 
 from .._backends.sync import SyncBackend
 from .._backends.base import SOCKET_OPTION, NetworkBackend
-from .._exceptions import ConnectionNotAvailable, UnsupportedProtocol
+from .._exceptions import (
+    ConnectionNotAvailable,
+    ReadError,
+    RemoteProtocolError,
+    UnsupportedProtocol,
+    WriteError,
+)
 from .._models import Origin, Proxy, Request, Response
 from .._synchronization import Event, ShieldCancellation, ThreadLock
 from .connection import HTTPConnection
 from .interfaces import ConnectionInterface, RequestInterface
+
+# HTTP methods that are guaranteed to be safe to retry on a fresh connection
+# if sending the request on a reused connection fails.
+IDEMPOTENT_METHODS = frozenset(
+    [b"GET", b"HEAD", b"PUT", b"DELETE", b"OPTIONS", b"TRACE"]
+)
 
 
 class PoolRequest:
     def __init__(self, request: Request) -> None:
         self.request = request
         self.connection: ConnectionInterface | None = None
+        self.connection_was_reused = False
+        self.stale_retry_attempted = False
         self._connection_acquired = Event()
 
     def assign_to_connection(self, connection: ConnectionInterface | None) -> None:
@@ -52,6 +67,8 @@ class ConnectionPool(RequestInterface):
         max_connections: int | None = 10,
         max_keepalive_connections: int | None = None,
         keepalive_expiry: float | None = None,
+        max_connection_age: float | None = None,
+        retry_stale_connections: bool = True,
         http1: bool = True,
         http2: bool = False,
         retries: int = 0,
@@ -74,6 +91,15 @@ class ConnectionPool(RequestInterface):
                 that will be maintained in the pool.
             keepalive_expiry: The duration in seconds that an idle HTTP connection
                 may be maintained for before being expired from the pool.
+            max_connection_age: The maximum duration in seconds that a connection
+                may be reused for, measured from when the connection was
+                established. An idle connection older than this is recycled
+                instead of being reused. Defaults to None, which does not limit
+                connection age. Unlike `keepalive_expiry` this timer is not
+                reset between requests.
+            retry_stale_connections: A boolean indicating if an idempotent
+                request that fails on a reused connection should be retried
+                once on a fresh connection. Defaults to True.
             http1: A boolean indicating if HTTP/1.1 requests should be supported
                 by the connection pool. Defaults to True.
             http2: A boolean indicating if HTTP/2 requests should be supported by
@@ -104,6 +130,8 @@ class ConnectionPool(RequestInterface):
         )
 
         self._keepalive_expiry = keepalive_expiry
+        self._max_connection_age = max_connection_age
+        self._retry_stale_connections = retry_stale_connections
         self._http1 = http1
         self._http2 = http2
         self._retries = retries
@@ -119,6 +147,15 @@ class ConnectionPool(RequestInterface):
         # and the set of connections that are servicing those requests.
         self._connections: list[ConnectionInterface] = []
         self._requests: list[PoolRequest] = []
+        # The time at which each connection was established, keyed by the
+        # connection instance.
+        self._connection_created_at: dict[ConnectionInterface, float] = {}
+
+        # Counters exposed by `get_stats()`. These are only mutated while
+        # holding `_optional_thread_lock`.
+        self._recycled_connections = 0
+        self._retried_requests = 0
+        self._idle_expired_connections = 0
 
         # We only mutate the state of the connection pool within an 'optional_thread_lock'
         # context. This holds a threading lock unless we're running in async mode,
@@ -242,6 +279,22 @@ class ConnectionPool(RequestInterface):
                     #
                     # In this case we clear the connection and try again.
                     pool_request.clear_connection()
+                except (WriteError, ReadError, RemoteProtocolError):
+                    if not self._should_retry_stale_connection(pool_request):
+                        raise
+                    # The request was sent on a connection that was reused from
+                    # the pool, and the connection turned out to be stale.
+                    # The request is idempotent, so we discard the connection
+                    # and retry the request once on a different connection.
+                    with self._optional_thread_lock:
+                        if connection in self._connections:
+                            self._connections.remove(connection)
+                            self._connection_created_at.pop(connection, None)
+                            self._recycled_connections += 1
+                        pool_request.stale_retry_attempted = True
+                        self._retried_requests += 1
+                    self._close_connections([connection])
+                    pool_request.clear_connection()
                 else:
                     break  # pragma: nocover
 
@@ -267,6 +320,17 @@ class ConnectionPool(RequestInterface):
             extensions=response.extensions,
         )
 
+    def _should_retry_stale_connection(self, pool_request: PoolRequest) -> bool:
+        # Requests are only retried if they are idempotent, if the failure
+        # occurred on a connection that was reused from the pool, and if we
+        # have not already retried this request.
+        return (
+            self._retry_stale_connections
+            and pool_request.connection_was_reused
+            and not pool_request.stale_retry_attempted
+            and pool_request.request.method in IDEMPOTENT_METHODS
+        )
+
     def _assign_requests_to_connections(self) -> list[ConnectionInterface]:
         """
         Manage the state of the connection pool, assigning incoming
@@ -280,15 +344,31 @@ class ConnectionPool(RequestInterface):
         closing_connections = []
 
         # First we handle cleaning up any connections that are closed,
-        # have expired their keep-alive, or surplus idle connections.
+        # have expired their keep-alive, have exceeded the maximum connection
+        # age, or surplus idle connections.
+        now = time.monotonic()
         for connection in list(self._connections):
             if connection.is_closed():
                 # log: "removing closed connection"
                 self._connections.remove(connection)
+                self._connection_created_at.pop(connection, None)
             elif connection.has_expired():
                 # log: "closing expired connection"
                 self._connections.remove(connection)
+                self._connection_created_at.pop(connection, None)
                 closing_connections.append(connection)
+                self._idle_expired_connections += 1
+            elif (
+                self._max_connection_age is not None
+                and connection.is_idle()
+                and now - self._connection_created_at.get(connection, now)
+                > self._max_connection_age
+            ):
+                # log: "recycling connection past max connection age"
+                self._connections.remove(connection)
+                self._connection_created_at.pop(connection, None)
+                closing_connections.append(connection)
+                self._recycled_connections += 1
             elif (
                 connection.is_idle()
                 and sum(connection.is_idle() for connection in self._connections)
@@ -296,6 +376,7 @@ class ConnectionPool(RequestInterface):
             ):
                 # log: "closing idle connection"
                 self._connections.remove(connection)
+                self._connection_created_at.pop(connection, None)
                 closing_connections.append(connection)
 
         # Assign queued requests to connections.
@@ -320,20 +401,26 @@ class ConnectionPool(RequestInterface):
             if available_connections:
                 # log: "reusing existing connection"
                 connection = available_connections[0]
+                pool_request.connection_was_reused = True
                 pool_request.assign_to_connection(connection)
             elif len(self._connections) < self._max_connections:
                 # log: "creating new connection"
                 connection = self.create_connection(origin)
                 self._connections.append(connection)
+                self._connection_created_at[connection] = time.monotonic()
+                pool_request.connection_was_reused = False
                 pool_request.assign_to_connection(connection)
             elif idle_connections:
                 # log: "closing idle connection"
                 connection = idle_connections[0]
                 self._connections.remove(connection)
+                self._connection_created_at.pop(connection, None)
                 closing_connections.append(connection)
                 # log: "creating new connection"
                 connection = self.create_connection(origin)
                 self._connections.append(connection)
+                self._connection_created_at[connection] = time.monotonic()
+                pool_request.connection_was_reused = False
                 pool_request.assign_to_connection(connection)
 
         return closing_connections
@@ -350,7 +437,27 @@ class ConnectionPool(RequestInterface):
         with self._optional_thread_lock:
             closing_connections = list(self._connections)
             self._connections = []
+            self._connection_created_at = {}
         self._close_connections(closing_connections)
+
+    def get_stats(self) -> dict[str, int]:
+        """
+        Return a snapshot of the connection pool health counters.
+
+        * `recycled`: Connections that were discarded because they exceeded
+          `max_connection_age`, or because a request failed on the reused
+          connection.
+        * `retried`: Requests that were retried on a fresh connection after
+          failing on a stale reused connection.
+        * `idle_expired`: Idle connections that were expired from the pool,
+          either by `keepalive_expiry` or because the server had disconnected.
+        """
+        with self._optional_thread_lock:
+            return {
+                "recycled": self._recycled_connections,
+                "retried": self._retried_requests,
+                "idle_expired": self._idle_expired_connections,
+            }
 
     def __enter__(self) -> ConnectionPool:
         return self

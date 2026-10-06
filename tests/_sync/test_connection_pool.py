@@ -519,6 +519,189 @@ def test_connection_pool_with_no_keepalive_connections_allowed():
 
 
 
+def test_connection_pool_recycles_connections_past_max_connection_age():
+    """
+    Connections that exceed `max_connection_age` should be recycled
+    rather than reused.
+    """
+    network_backend = httpcore.MockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+
+    with httpcore.ConnectionPool(
+        max_connection_age=0.0, network_backend=network_backend
+    ) as pool:
+        # Each request uses a freshly established connection, since any
+        # IDLE connection has immediately exceeded the maximum age.
+        response = pool.request("GET", "https://example.com/")
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+        info = [repr(c) for c in pool.connections]
+        assert info == []
+
+        response = pool.request("GET", "https://example.com/")
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+        info = [repr(c) for c in pool.connections]
+        assert info == []
+
+        assert pool.get_stats() == {"recycled": 2, "retried": 0, "idle_expired": 0}
+
+
+
+def test_connection_pool_retries_idempotent_request_on_stale_connection():
+    """
+    An idempotent request that fails on a stale reused connection should be
+    retried once on a fresh connection.
+    """
+    network_backend = httpcore.MockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+
+    with httpcore.ConnectionPool(network_backend=network_backend) as pool:
+        # An initial request, leaving an IDLE connection in the pool.
+        response = pool.request("GET", "https://example.com/")
+        assert response.status == 200
+
+        # The IDLE connection has been silently closed by the server. The mock
+        # simulates this since no further response is available on the reused
+        # connection, while freshly established connections include a response.
+        response = pool.request("GET", "https://example.com/")
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+
+        assert pool.get_stats() == {"recycled": 1, "retried": 1, "idle_expired": 0}
+
+
+
+def test_connection_pool_does_not_retry_non_idempotent_request():
+    """
+    A non-idempotent request that fails on a stale reused connection should
+    raise the original error, rather than being retried.
+    """
+    network_backend = httpcore.MockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+
+    with httpcore.ConnectionPool(network_backend=network_backend) as pool:
+        # An initial request, leaving an IDLE connection in the pool.
+        response = pool.request("GET", "https://example.com/")
+        assert response.status == 200
+
+        # The stale connection is reused, the request fails, and the
+        # error is propagated to the caller without any retry.
+        with pytest.raises(httpcore.RemoteProtocolError):
+            pool.request("POST", "https://example.com/")
+
+        assert pool.get_stats() == {"recycled": 0, "retried": 0, "idle_expired": 0}
+
+
+
+def test_connection_pool_with_retry_stale_connections_disabled():
+    """
+    With `retry_stale_connections=False` no retry should be attempted when
+    a request fails on a stale reused connection.
+    """
+    network_backend = httpcore.MockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+
+    with httpcore.ConnectionPool(
+        retry_stale_connections=False, network_backend=network_backend
+    ) as pool:
+        # An initial request, leaving an IDLE connection in the pool.
+        response = pool.request("GET", "https://example.com/")
+        assert response.status == 200
+
+        with pytest.raises(httpcore.RemoteProtocolError):
+            pool.request("GET", "https://example.com/")
+
+        assert pool.get_stats() == {"recycled": 0, "retried": 0, "idle_expired": 0}
+
+
+
+def test_connection_pool_stats_with_keepalive_expiry():
+    """
+    Connections that expire due to `keepalive_expiry` should be included
+    in the `idle_expired` stat.
+    """
+    network_backend = httpcore.MockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+
+    with httpcore.ConnectionPool(
+        keepalive_expiry=0.0, network_backend=network_backend
+    ) as pool:
+        response = pool.request("GET", "https://example.com/")
+        assert response.status == 200
+
+        assert pool.get_stats() == {"recycled": 0, "retried": 0, "idle_expired": 1}
+
+
+
+def test_connection_pool_concurrent_connection_recycling():
+    """
+    Connections recycled under concurrency must be counted exactly once.
+    """
+    network_backend = httpcore.MockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+
+    def fetch(pool, results):
+        response = pool.request("GET", "https://example.com/")
+        results.append(response.status)
+
+    with httpcore.ConnectionPool(
+        max_connection_age=0.0, network_backend=network_backend
+    ) as pool:
+        results: typing.List[int] = []
+        with concurrency.open_nursery() as nursery:
+            for _ in range(5):
+                nursery.start_soon(fetch, pool, results)
+
+        # Every request used a freshly established connection, since any IDLE
+        # connection immediately exceeds the maximum connection age.
+        assert sorted(results) == [200] * 5
+        assert pool.get_stats() == {"recycled": 5, "retried": 0, "idle_expired": 0}
+
+
+
 def test_connection_pool_concurrency():
     """
     HTTP/1.1 requests made in concurrency must not ever exceed the maximum number

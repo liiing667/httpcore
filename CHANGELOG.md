@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## Unreleased
 
+- Add `max_connection_age` and `retry_stale_connections` arguments to the connection
+  pools, together with a `get_stats()` API exposing `recycled`, `retried` and
+  `idle_expired` counters.
 - Fix `max_keepalive_connections` not being properly handled. (#1000)
 
 ## Version 1.0.9 (April 24th, 2025)
